@@ -2,12 +2,112 @@ use std::error::Error;
 
 use async_openai::{Client, config::OpenAIConfig};
 use rmcp::{
-    RmcpError, ServiceExt,
-    model::ListToolsResult,
+    RmcpError, RoleClient, ServiceExt,
+    model::{CallToolRequestParam, ListToolsResult},
+    service::RunningService,
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde_json::{Value, json};
 use tokio::process::Command;
+
+fn extract_tool_call_info(tool_call: &Value) -> Result<(String, String, String), Box<dyn Error>> {
+    let tool_id = tool_call
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let function = tool_call.get("function").ok_or("Missing function")?;
+    let name = function
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = function
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .unwrap_or("{}")
+        .to_string();
+
+    Ok((tool_id, name, args))
+}
+
+async fn call_llm(
+    client: &Client<OpenAIConfig>,
+    messages: &[Value],
+    tools: &ListToolsResult,
+) -> Result<Value, Box<dyn Error>> {
+    let response = client
+        .completions()
+        .create_byot(json!({
+            "messages": messages,
+            "model": "gpt-4",
+            "tools": format_tools(tools).await?,
+        }))
+        .await?;
+
+    Ok(response)
+}
+
+async fn process_llm_response(
+    llm_response: &Value,
+    mcp_client: &RunningService<RoleClient, ()>,
+    openai_client: &Client<OpenAIConfig>,
+    mcp_tools: &ListToolsResult,
+    messages: &mut Vec<Value>,
+) -> Result<(), Box<dyn Error>> {
+    let Some(message) = llm_response
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+    else {
+        return Ok(());
+    };
+
+    // Print content if available
+    if let Some(content) = message.get("content").and_then(|c| c.as_str()) {
+        println!("🤖 {}", content);
+    }
+
+    // Handle tool calls
+    if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array()) {
+        messages.push(message.clone()); // Add assistant message
+
+        // Execute each tool call
+        for tool_call in tool_calls {
+            let (tool_id, name, args) = extract_tool_call_info(tool_call)?;
+            println!("⚡ Calling tool: {}", name);
+
+            let result = mcp_client
+                .call_tool(CallToolRequestParam {
+                    name: name.into(),
+                    arguments: serde_json::from_str::<Value>(&args)?.as_object().cloned(),
+                })
+                .await?;
+
+            // Add tool result to messages
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": serde_json::to_string_pretty(&result)?
+            }));
+        }
+
+        // Continue conversation with tool results
+        let response = call_llm(openai_client, messages, mcp_tools).await?;
+        Box::pin(process_llm_response(
+            &response,
+            mcp_client,
+            openai_client,
+            mcp_tools,
+            messages,
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
 
 async fn format_tools(tools: &ListToolsResult) -> Result<Vec<Value>, Box<dyn Error>> {
     let tools_json = serde_json::to_value(tools)?;
@@ -42,8 +142,10 @@ async fn format_tools(tools: &ListToolsResult) -> Result<Vec<Value>, Box<dyn Err
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt::init();
+
     // Initial message
-    let mut message = vec![json!({
+    let mut messages = vec![json!({
         "role": "user",
         "content": "What is the sum of 3 and 2?"
     })];
@@ -72,10 +174,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
 
-    // ToDo: Get MCP tool listing
+    // Get MCP tool listing
     let tools = mcp_client.list_tools(Default::default()).await?;
 
-    // ToDo: LLM conversation with tool calls
+    // LLM conversation with tool calls
+    let response = call_llm(&openai_client, &messages, &tools).await?;
+    process_llm_response(
+        &response,
+        &mcp_client,
+        &openai_client,
+        &tools,
+        &mut messages,
+    )
+    .await?;
 
     Ok(())
 }
