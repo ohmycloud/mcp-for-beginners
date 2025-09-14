@@ -1,3 +1,3 @@
 [workspace]
-members = ["calculator-client", "calculator-server"]
+members = ["calculator-client", "calculator-llmclient", "calculator-server"]
 resolver = "2"
