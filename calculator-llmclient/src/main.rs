@@ -3,10 +3,42 @@ use std::error::Error;
 use async_openai::{Client, config::OpenAIConfig};
 use rmcp::{
     RmcpError, ServiceExt,
+    model::ListToolsResult,
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::process::Command;
+
+async fn format_tools(tools: &ListToolsResult) -> Result<Vec<Value>, Box<dyn Error>> {
+    let tools_json = serde_json::to_value(tools)?;
+    let Some(tools_array) = tools_json.get("tools").and_then(|t| t.as_array()) else {
+        return Ok(vec![]);
+    };
+
+    let formatted_tools = tools_array
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name")?.as_str()?;
+            let description = tool.get("description")?.as_str()?;
+            let schema = tool.get("inputSchema")?;
+
+            Some(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": schema.get("properties").unwrap_or(&json!({})),
+                        "required": schema.get("required").unwrap_or(&json!([]))
+                    }
+                }
+            }))
+        })
+        .collect();
+
+    Ok(formatted_tools)
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -41,6 +73,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
 
     // ToDo: Get MCP tool listing
+    let tools = mcp_client.list_tools(Default::default()).await?;
+
     // ToDo: LLM conversation with tool calls
 
     Ok(())
